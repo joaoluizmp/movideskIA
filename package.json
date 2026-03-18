@@ -1,0 +1,16 @@
+{
+  "name": "movidesk-ia",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@vscode/vsce": "^3.7.1",
+    "axios": "^1.8.4",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "openai": "^6.27.0"
+  }
+}

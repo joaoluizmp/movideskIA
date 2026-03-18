@@ -1,0 +1,69 @@
+Estou desenvolvendo um projeto chamado **Movidesk + IA**, que automatiza a geração de tarefas N2 a partir de análises feitas em tickets do Movidesk.
+
+Arquitetura do sistema:
+
+• O analista escreve a análise em uma **ação interna do ticket** no Movidesk.
+• O analista adiciona a tag **GERAR_TAREFA_N2** ao ticket.
+• Uma automação do Movidesk dispara um **webhook** para meu servidor Node.js.
+
+Webhook chamado:
+POST /webhook
+
+Fluxo do processamento:
+
+1. O servidor Node recebe o **ticketId**.
+2. Ele consulta o ticket na **API do Movidesk**.
+3. Busca a última **ação interna com a análise do analista**.
+4. O texto da análise é enviado para a **OpenAI API**.
+5. A IA transforma o texto em uma **tarefa N2 padronizada**.
+6. O servidor publica uma **nova ação interna no ticket** com a tarefa estruturada.
+7. O sistema remove a tag **GERAR_TAREFA_N2**.
+8. O sistema adiciona a tag **TAREFA_N2_GERADA**.
+
+Stack utilizada:
+
+• Node.js
+• Express
+• OpenAI API
+• Movidesk API
+• ngrok (para expor webhook local)
+
+Variáveis do .env principais:
+
+PORT=3000
+MOVIDESK_BASE_URL=https://api.movidesk.com/public/v1
+MOVIDESK_TOKEN=TOKEN
+OPENAI_API_KEY=KEY
+OPENAI_MODEL=gpt-4.1-mini
+
+TAG_GERAR=GERAR_TAREFA_N2
+TAG_GERADA=TAREFA_N2_GERADA
+TAG_ERRO=ERRO_GERAR_TAREFA_N2
+
+Formato obrigatório da tarefa N2 gerada:
+
+1. OCORRÊNCIA
+   • Quem solicita:
+   • Motivação:
+   • Recurso do sistema:
+
+2. VERIFICAÇÃO REALIZADA
+   • Análise do caso:
+   • Motivo do encaminhamento:
+
+3. EXPECTATIVA
+   • O que precisa ser feito:
+   ◦ Verificação da Causa Raiz
+   ◦ Correção do Caso Evidenciado
+   ◦ Investigação e Correção de Novos Casos
+   • Detalhes importantes:
+
+4. IMPACTO
+   • Classificação do impacto:
+   • Descrição do impacto:
+
+Objetivo do projeto:
+
+Automatizar a geração de tarefas N2 no Movidesk usando IA para transformar análises dos analistas em tarefas estruturadas, reduzindo tempo operacional e padronizando as solicitações técnicas.
+
+Quero continuar evoluindo esse projeto neste chat.
