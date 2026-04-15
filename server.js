@@ -1,531 +1,536 @@
-import dotenv from "dotenv";
-dotenv.config();
-
+// server.js
 import express from "express";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import OpenAI from "openai";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "5mb" }));
 
-/* =========================
- * CONFIG
- * ========================= */
-const PORT = Number(process.env.PORT || 3000);
+// =====================================================================================
+// CONFIG
+// =====================================================================================
 
+const PORT = process.env.PORT || 3000;
+const HOST = "0.0.0.0";
+
+const MOVIDESK_TOKEN = process.env.MOVIDESK_TOKEN;
 const MOVIDESK_BASE_URL =
   process.env.MOVIDESK_BASE_URL || "https://api.movidesk.com/public/v1";
-const MOVIDESK_TOKEN = process.env.MOVIDESK_TOKEN;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-const TAG_GERAR = process.env.TAG_GERAR || "GERAR_TAREFA_N2";
-const TAG_GERADA = process.env.TAG_GERADA || "TAREFA_N2_GERADA";
-const TAG_ERRO = process.env.TAG_ERRO || "ERRO_GERAR_TAREFA_N2";
+const TAG_TRIGGER = "GERAR_TAREFA_N2";
+const TAG_SUCCESS = "TAREFA_N2_GERADA";
+const TAG_ERROR = "ERRO_GERAR_TAREFA_N2";
 
-const STORE_DIR = process.env.STORE_DIR || path.join(__dirname, "data");
-const PROCESSED_EVENTS_FILE =
-  process.env.PROCESSED_EVENTS_FILE ||
-  path.join(STORE_DIR, "processed-events.json");
+const AUTOMATION_AUTHOR_NAMES = [
+  "OpenAI",
+  "Automação N2",
+  "Automacao N2",
+  "Webhook N2",
+  "Integração N2",
+  "Integracao N2",
+  "IA N2",
+];
 
-const MAX_HISTORY_ACTIONS = Number(process.env.MAX_HISTORY_ACTIONS || 30);
-const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
+const DATA_DIR = path.join(__dirname, "data");
+const PROCESSED_FILE = path.join(DATA_DIR, "processed-events.json");
 
-/* =========================
- * VALIDACOES INICIAIS
- * ========================= */
-if (!MOVIDESK_TOKEN) {
-  throw new Error("Variável MOVIDESK_TOKEN não configurada.");
-}
+const activeProcessingKeys = new Set();
 
-if (!OPENAI_API_KEY) {
-  throw new Error("Variável OPENAI_API_KEY não configurada.");
-}
+ensureDataFiles();
 
-if (!fs.existsSync(STORE_DIR)) {
-  fs.mkdirSync(STORE_DIR, { recursive: true });
-}
+// =====================================================================================
+// START
+// =====================================================================================
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
+app.listen(PORT, HOST, () => {
+  console.log(`[START] Servidor rodando em http://${HOST}:${PORT}`);
 });
 
-/* =========================
- * LOGGER
- * ========================= */
-function log(level, message, meta = {}) {
-  const ts = new Date().toISOString();
-  const payload = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : "";
-  console.log(`[${ts}] [${level}] ${message}${payload}`);
-}
+// =====================================================================================
+// ROUTES
+// =====================================================================================
 
-function info(message, meta) {
-  log("INFO", message, meta);
-}
-
-function warn(message, meta) {
-  log("WARN", message, meta);
-}
-
-function error(message, meta) {
-  log("ERROR", message, meta);
-}
-
-/* =========================
- * STORE DE EVENTOS PROCESSADOS
- * ========================= */
-function loadProcessedEvents() {
-  try {
-    if (!fs.existsSync(PROCESSED_EVENTS_FILE)) {
-      fs.writeFileSync(PROCESSED_EVENTS_FILE, JSON.stringify({}, null, 2), "utf8");
-      return {};
-    }
-
-    const raw = fs.readFileSync(PROCESSED_EVENTS_FILE, "utf8");
-    return raw ? JSON.parse(raw) : {};
-  } catch (err) {
-    error("Falha ao carregar processed-events.json", { error: err.message });
-    return {};
-  }
-}
-
-function saveProcessedEvents(store) {
-  try {
-    fs.writeFileSync(PROCESSED_EVENTS_FILE, JSON.stringify(store, null, 2), "utf8");
-  } catch (err) {
-    error("Falha ao salvar processed-events.json", { error: err.message });
-  }
-}
-
-const processedEvents = loadProcessedEvents();
-
-function hasProcessedEvent(processingKey) {
-  return Boolean(processedEvents[processingKey]);
-}
-
-function markProcessedEvent(processingKey, ticketId, actionKey) {
-  processedEvents[processingKey] = {
-    ticketId,
-    actionKey,
-    processedAt: new Date().toISOString(),
-  };
-  saveProcessedEvents(processedEvents);
-}
-
-/* =========================
- * FILA DE PROCESSAMENTO
- * ========================= */
-const queue = [];
-const activeProcessingKeys = new Set();
-let queueRunning = false;
-
-function enqueueJob(job) {
-  queue.push(job);
-  processQueue().catch((err) => {
-    error("Erro no loop principal da fila", { error: err.message });
+app.get("/health", async (_req, res) => {
+  res.json({
+    ok: true,
+    service: "movidesk-ia-n2",
+    time: new Date().toISOString(),
+    model: OPENAI_MODEL,
+    movideskBaseUrl: MOVIDESK_BASE_URL,
   });
-}
+});
 
-async function processQueue() {
-  if (queueRunning) return;
-  queueRunning = true;
+app.post("/webhook", async (req, res) => {
+  try {
+    const body = req.body || {};
+    console.log("[WEBHOOK] Payload recebido:", JSON.stringify(body, null, 2));
 
-  while (queue.length > 0) {
-    const job = queue.shift();
+    const ticketId = extractTicketId(body);
 
-    try {
-      await processTicketJob(job);
-    } catch (err) {
-      error("Falha ao processar job da fila", {
-        ticketId: job.ticketId,
-        error: err.message,
+    if (!ticketId) {
+      console.warn("[WEBHOOK] Não foi possível identificar o ticketId.");
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "ticketId não encontrado no payload",
       });
     }
-  }
 
-  queueRunning = false;
-}
+    const payloadText = safeLower(JSON.stringify(body));
+    const hasTriggerTagInPayload = payloadText.includes(safeLower(TAG_TRIGGER));
 
-/* =========================
- * HELPERS GERAIS
- * ========================= */
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+    // Se o payload não trouxer tags claramente, ainda deixamos seguir:
+    // vamos validar no ticket depois.
+    const referenceDate = extractEventDate(body) || new Date();
 
-async function retry(fn, label, retries = MAX_RETRIES) {
-  let attempt = 0;
-  let lastError;
+    const processingKey = buildProcessingKey({
+      source: "webhook",
+      ticketId,
+      referenceDate,
+      payload: body,
+    });
 
-  while (attempt < retries) {
-    attempt += 1;
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      warn(`${label} falhou`, {
-        tentativa: attempt,
-        maxTentativas: retries,
-        error: err.message,
+    if (isProcessingOrProcessed(processingKey)) {
+      console.log("[WEBHOOK] Evento duplicado ignorado:", processingKey);
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "evento duplicado",
+      });
+    }
+
+    markProcessing(processingKey);
+
+    processTicketFlow({
+      ticketId,
+      referenceDate,
+      processingKey,
+      triggerValidationMode: hasTriggerTagInPayload ? "soft-confirmed" : "ticket-confirm",
+    })
+      .catch((err) => {
+        console.error("[WEBHOOK] Erro assíncrono no processamento:", err);
       });
 
-      if (attempt < retries) {
-        const waitMs = attempt * 2000;
-        await sleep(waitMs);
+    return res.status(202).json({
+      ok: true,
+      accepted: true,
+      ticketId,
+      processingKey,
+    });
+  } catch (error) {
+    console.error("[WEBHOOK] Erro:", error);
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/process/:ticketId", async (req, res) => {
+  try {
+    const ticketId = Number(req.params.ticketId);
+    if (!ticketId) {
+      return res.status(400).json({ ok: false, error: "ticketId inválido" });
+    }
+
+    const referenceDate = new Date();
+    const processingKey = buildProcessingKey({
+      source: "manual",
+      ticketId,
+      referenceDate,
+      payload: req.body || {},
+    });
+
+    if (isProcessingOrProcessed(processingKey)) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "processamento já realizado",
+        processingKey,
+      });
+    }
+
+    markProcessing(processingKey);
+
+    const result = await processTicketFlow({
+      ticketId,
+      referenceDate,
+      processingKey,
+      triggerValidationMode: "manual",
+    });
+
+    return res.json({
+      ok: true,
+      result,
+    });
+  } catch (error) {
+    console.error("[MANUAL PROCESS] Erro:", error);
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+});
+
+// =====================================================================================
+// MAIN FLOW
+// =====================================================================================
+
+async function processTicketFlow({
+  ticketId,
+  referenceDate = new Date(),
+  processingKey,
+  triggerValidationMode = "ticket-confirm",
+}) {
+  console.log(`[FLOW] Iniciando processamento do ticket ${ticketId}`);
+
+  try {
+    const ticket = await getTicketById(ticketId);
+
+    if (!ticket) {
+      throw new Error(`Ticket ${ticketId} não encontrado no Movidesk.`);
+    }
+
+    const currentTags = getTicketTags(ticket);
+
+    if (triggerValidationMode !== "manual") {
+      if (!hasTag(currentTags, TAG_TRIGGER)) {
+        console.log(
+          `[FLOW] Ticket ${ticketId} não possui a tag ${TAG_TRIGGER}. Ignorado.`
+        );
+        markProcessed(processingKey, {
+          status: "ignored",
+          reason: "tag trigger ausente no ticket",
+          ticketId,
+        });
+        unmarkProcessing(processingKey);
+        return {
+          ignored: true,
+          reason: `tag ${TAG_TRIGGER} ausente`,
+          ticketId,
+        };
       }
     }
-  }
 
-  throw lastError;
-}
+    const actions = Array.isArray(ticket.actions) ? ticket.actions : [];
 
-function sha1(input) {
-  return crypto.createHash("sha1").update(String(input)).digest("hex");
-}
+    const {
+      selectedAction,
+      selectedText,
+      candidates,
+    } = selectBestN2SourceAction(actions, {
+      automationAuthorNames: AUTOMATION_AUTHOR_NAMES,
+      referenceDate,
+      debug: true,
+    });
 
-function normalizeText(value) {
-  if (value == null) return "";
-  return String(value)
-    .replace(/\r/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function sanitizeHtml(html = "") {
-  return String(html)
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<li>/gi, "• ")
-    .replace(/<\/li>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .trim();
-}
-
-function escapeHtml(text = "") {
-  return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function n2MarkdownToHtml(text = "") {
-  const lines = String(text).replace(/\r/g, "").split("\n");
-  const htmlLines = [];
-
-  for (let line of lines) {
-    line = escapeHtml(line);
-
-    line = line.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
-
-    if (/^\s*•\s+/.test(line)) {
-      line = line.replace(/^\s*•\s+/, "&bull; ");
+    if (!selectedAction || !selectedText) {
+      throw new Error(
+        "Nenhuma ação interna válida foi encontrada para gerar a tarefa N2."
+      );
     }
 
-    if (/^\s*◦\s+/.test(line)) {
-      line = line.replace(/^\s*◦\s+/, "&nbsp;&nbsp;&nbsp;&nbsp;&#9702; ");
+    const sourceFingerprint = buildSourceFingerprint(ticketId, selectedAction, selectedText);
+
+    if (hasProcessedSourceFingerprint(sourceFingerprint)) {
+      console.log(
+        `[FLOW] Ticket ${ticketId} já teve essa mesma ação processada. Ignorado.`
+      );
+      markProcessed(processingKey, {
+        status: "ignored",
+        reason: "mesma ação já processada",
+        ticketId,
+        sourceFingerprint,
+      });
+      unmarkProcessing(processingKey);
+      return {
+        ignored: true,
+        reason: "mesma ação já processada",
+        ticketId,
+        sourceFingerprint,
+      };
     }
 
-    htmlLines.push(line || "&nbsp;");
-  }
+    console.log("[FLOW] Ação escolhida para geração:", {
+      author: getActionAuthorName(selectedAction),
+      date: getActionDate(selectedAction)?.toISOString?.() || null,
+      preview: selectedText.slice(0, 300),
+    });
 
-  return htmlLines.join("<br>");
+    const prompt = buildN2Prompt(selectedText);
+
+    const gptText = await generateN2Task(prompt);
+
+    if (!gptText || !gptText.trim()) {
+      throw new Error("A OpenAI retornou conteúdo vazio.");
+    }
+
+    const htmlForMovidesk = markdownLikeToHtml(gptText);
+
+    await addInternalActionToTicket(ticketId, htmlForMovidesk);
+
+    const updatedTags = mergeTags(currentTags, {
+      remove: [TAG_TRIGGER, TAG_ERROR],
+      add: [TAG_SUCCESS],
+    });
+
+    await updateTicketTags(ticketId, updatedTags);
+
+    markProcessed(processingKey, {
+      status: "success",
+      ticketId,
+      sourceFingerprint,
+      selectedActionDate: getActionDate(selectedAction)?.toISOString?.() || null,
+      selectedActionAuthor: getActionAuthorName(selectedAction),
+      preview: selectedText.slice(0, 200),
+    });
+
+    unmarkProcessing(processingKey);
+
+    console.log(`[FLOW] Ticket ${ticketId} processado com sucesso.`);
+
+    return {
+      success: true,
+      ticketId,
+      selectedActionAuthor: getActionAuthorName(selectedAction),
+      selectedActionDate: getActionDate(selectedAction)?.toISOString?.() || null,
+      candidatesCount: candidates.length,
+      sourceFingerprint,
+    };
+  } catch (error) {
+    console.error(`[FLOW] Erro ao processar ticket ${ticketId}:`, error);
+
+    try {
+      const ticket = await safeGetTicketById(ticketId);
+      if (ticket) {
+        const currentTags = getTicketTags(ticket);
+        const updatedTags = mergeTags(currentTags, {
+          remove: [],
+          add: [TAG_ERROR],
+        });
+        await updateTicketTags(ticketId, updatedTags);
+      }
+    } catch (tagError) {
+      console.error("[FLOW] Falha ao aplicar tag de erro:", tagError);
+    }
+
+    markProcessed(processingKey, {
+      status: "error",
+      ticketId,
+      error: error.message,
+    });
+
+    unmarkProcessing(processingKey);
+    throw error;
+  }
 }
 
-function buildUrl(endpoint, query = {}) {
-  const url = new URL(`${MOVIDESK_BASE_URL}${endpoint}`);
+// =====================================================================================
+// MOVIDESK
+// =====================================================================================
+
+async function getTicketById(ticketId) {
+  if (!MOVIDESK_TOKEN) {
+    throw new Error("MOVIDESK_TOKEN não configurado.");
+  }
+
+  const url = new URL(`${MOVIDESK_BASE_URL}/tickets`);
   url.searchParams.set("token", MOVIDESK_TOKEN);
+  url.searchParams.set("id", String(ticketId));
+  url.searchParams.set("$expand", "actions,owner,createdBy");
 
-  for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, value);
-    }
-  }
-
-  return url.toString();
-}
-
-async function movideskRequest(endpoint, options = {}, query = {}) {
-  const url = buildUrl(endpoint, query);
-
-  const response = await fetch(url, {
-    ...options,
+  const response = await fetch(url.toString(), {
+    method: "GET",
     headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
+      Accept: "application/json",
     },
   });
 
   const text = await response.text();
-  let data;
-
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
-  }
 
   if (!response.ok) {
     throw new Error(
-      `Movidesk ${response.status} ${response.statusText} - ${
-        typeof data === "string" ? data : JSON.stringify(data)
-      }`
+      `Erro ao buscar ticket no Movidesk. Status ${response.status}. Body: ${text}`
     );
   }
 
-  return data;
+  const data = parseJsonSafe(text);
+
+  if (Array.isArray(data)) {
+    return data[0] || null;
+  }
+
+  return data || null;
 }
 
-/* =========================
- * MOVIDESK
- * ========================= */
-async function getTicketById(ticketId) {
-  return movideskRequest(
-    `/tickets`,
-    { method: "GET" },
-    {
-      id: ticketId,
-      $expand: "actions,owner,createdBy",
-    }
-  );
+async function safeGetTicketById(ticketId) {
+  try {
+    return await getTicketById(ticketId);
+  } catch {
+    return null;
+  }
 }
 
-async function createInternalAction(ticketId, descriptionHtml) {
-  return movideskRequest(
-    `/tickets`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({
-        actions: [
-          {
-            description: descriptionHtml,
-            type: 1,
-          },
-        ],
-      }),
+async function addInternalActionToTicket(ticketId, htmlText) {
+  if (!MOVIDESK_TOKEN) {
+    throw new Error("MOVIDESK_TOKEN não configurado.");
+  }
+
+  const url = new URL(`${MOVIDESK_BASE_URL}/tickets`);
+  url.searchParams.set("token", MOVIDESK_TOKEN);
+  url.searchParams.set("id", String(ticketId));
+
+  const body = {
+    actions: [
+      {
+        description: htmlText,
+        type: 1, // ação interna
+      },
+    ],
+  };
+
+  const response = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
     },
-    {
-      id: ticketId,
-    }
-  );
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Erro ao adicionar ação interna no ticket ${ticketId}. Status ${response.status}. Body: ${text}`
+    );
+  }
+
+  return parseJsonSafe(text);
 }
 
 async function updateTicketTags(ticketId, tags) {
-  const uniqueTags = [...new Set((tags || []).map((t) => String(t).trim()).filter(Boolean))];
+  if (!MOVIDESK_TOKEN) {
+    throw new Error("MOVIDESK_TOKEN não configurado.");
+  }
 
-  return movideskRequest(
-    `/tickets`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({
-        tags: uniqueTags,
-      }),
+  const url = new URL(`${MOVIDESK_BASE_URL}/tickets`);
+  url.searchParams.set("token", MOVIDESK_TOKEN);
+  url.searchParams.set("id", String(ticketId));
+
+  const body = {
+    tags,
+  };
+
+  const response = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
     },
-    {
-      id: ticketId,
-    }
-  );
-}
-
-/* =========================
- * EXTRAÇÃO DE TAGS / AÇÕES
- * ========================= */
-function extractTicketIdFromWebhook(body) {
-  const candidates = [
-    body?.ticket?.id,
-    body?.ticket?.Id,
-    body?.ticketId,
-    body?.TicketId,
-    body?.id,
-    body?.Id,
-    body?.data?.ticket?.id,
-    body?.data?.ticket?.Id,
-    body?.data?.id,
-    body?.data?.Id,
-    body?.object?.id,
-    body?.object?.Id,
-  ];
-
-  const found = candidates.find((value) => value !== undefined && value !== null && value !== "");
-
-  return found ?? null;
-}
-
-function extractTags(ticket) {
-  const rawTags = ticket?.tags;
-
-  if (!rawTags) return [];
-
-  if (Array.isArray(rawTags)) {
-    return rawTags
-      .map((tag) => {
-        if (typeof tag === "string") return tag.trim();
-        if (tag && typeof tag === "object") {
-          return String(tag.name || tag.tag || tag.value || "").trim();
-        }
-        return "";
-      })
-      .filter(Boolean);
-  }
-
-  if (typeof rawTags === "string") {
-    return rawTags
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-  }
-
-  return [];
-}
-
-function addTag(tags, tagToAdd) {
-  const set = new Set((tags || []).map((t) => String(t).trim()).filter(Boolean));
-  set.add(tagToAdd);
-  return [...set];
-}
-
-function removeTag(tags, tagToRemove) {
-  return (tags || []).filter((t) => String(t).trim() !== tagToRemove);
-}
-
-function extractActions(ticket) {
-  const actions = Array.isArray(ticket?.actions) ? ticket.actions : [];
-
-  return actions
-    .map((action, index) => {
-      const text = normalizeText(
-        action?.description || sanitizeHtml(action?.htmlDescription || "")
-      );
-
-      return {
-        raw: action,
-        id: action?.id || null,
-        index,
-        type: action?.type ?? null,
-        createdDate: action?.createdDate || null,
-        createdBy:
-          action?.createdBy?.businessName ||
-          action?.createdBy?.name ||
-          action?.owner?.businessName ||
-          "",
-        description: text,
-      };
-    })
-    .sort((a, b) => {
-      const da = new Date(a.createdDate || 0).getTime();
-      const db = new Date(b.createdDate || 0).getTime();
-      return da - db;
-    });
-}
-
-function isGeneratedN2Text(text = "") {
-  const t = String(text).toLowerCase();
-  return (
-    t.includes("1. ocorrência") &&
-    t.includes("2. verificação realizada") &&
-    t.includes("3. expectativa") &&
-    t.includes("4. impacto")
-  );
-}
-
-function findTriggerAction(ticket) {
-  const actions = extractActions(ticket);
-
-  const filtered = actions.filter((a) => {
-    if (!a.description) return false;
-
-    const text = a.description.toLowerCase();
-
-    if (isGeneratedN2Text(text)) return false;
-    if (text.includes(TAG_GERAR.toLowerCase())) return false;
-    if (text.includes(TAG_GERADA.toLowerCase())) return false;
-    if (text.includes(TAG_ERRO.toLowerCase())) return false;
-
-    return true;
+    body: JSON.stringify(body),
   });
 
-  if (!filtered.length) return null;
+  const text = await response.text();
 
-  return filtered[filtered.length - 1];
-}
-
-function buildActionKey(triggerAction) {
-  if (!triggerAction) return null;
-
-  if (triggerAction.id) return String(triggerAction.id);
-
-  const fallback = `${triggerAction.createdDate || ""}|${triggerAction.description || ""}`;
-  return sha1(fallback);
-}
-
-function buildProcessingKey(ticketId, actionKey) {
-  return `${ticketId}:${actionKey}`;
-}
-
-function buildHistoryForPrompt(ticket) {
-  const actions = extractActions(ticket)
-    .filter((a) => a.description)
-    .slice(-MAX_HISTORY_ACTIONS);
-
-  if (!actions.length) {
-    return "Nenhuma ação encontrada no histórico do ticket.";
+  if (!response.ok) {
+    throw new Error(
+      `Erro ao atualizar tags do ticket ${ticketId}. Status ${response.status}. Body: ${text}`
+    );
   }
 
-  return actions
-    .map((a, idx) => {
-      return [
-        `Ação ${idx + 1}:`,
-        `Data: ${a.createdDate || "N/A"}`,
-        `Autor: ${a.createdBy || "N/A"}`,
-        `Tipo: ${a.type ?? "N/A"}`,
-        `Texto:`,
-        a.description,
-      ].join("\n");
-    })
-    .join("\n\n------------------------------\n\n");
+  return parseJsonSafe(text);
 }
 
-/* =========================
- * OPENAI
- * ========================= */
-function buildN2Prompt(ticket) {
-  const history = buildHistoryForPrompt(ticket);
+// =====================================================================================
+// OPENAI
+// =====================================================================================
 
+async function generateN2Task(prompt) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY não configurada.");
+  }
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                "Você é um especialista em suporte técnico e redação de tarefas N2.",
+                "Sua função é transformar uma análise de suporte em uma tarefa N2 clara, objetiva e padronizada.",
+                "Nunca misture assuntos diferentes.",
+                "Use somente o conteúdo fornecido pelo usuário.",
+                "Não invente informações.",
+                "Se faltar algum dado, mantenha a redação neutra sem criar detalhes falsos.",
+                "Responda exatamente no formato solicitado.",
+              ].join(" "),
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: prompt,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Erro na OpenAI. Status ${response.status}. Body: ${text}`
+    );
+  }
+
+  const data = parseJsonSafe(text);
+  const outputText = extractResponseOutputText(data);
+
+  return outputText?.trim();
+}
+
+function buildN2Prompt(sourceText) {
   return `
-Você é um especialista em transformar histórico de tickets do Movidesk em tarefas técnicas N2.
+Você é responsável por transformar uma análise de suporte em uma tarefa N2.
 
-Gere a tarefa EXATAMENTE no padrão abaixo.
+REGRAS IMPORTANTES:
+- Use SOMENTE o conteúdo fornecido abaixo.
+- NÃO invente informações.
+- NÃO misture com outros possíveis assuntos do ticket.
+- Se algum dado estiver ausente, mantenha a redação neutra sem criar detalhes.
+- Preserve o assunto principal exatamente como descrito.
+- Escreva em português do Brasil.
+- Retorne exatamente no layout abaixo.
 
-Regras obrigatórias:
-1. As seções devem ser numeradas e em negrito:
-**1. OCORRÊNCIA**
-**2. VERIFICAÇÃO REALIZADA**
-**3. EXPECTATIVA**
-**4. IMPACTO**
+TEXTO BASE:
+"""
+${sourceText}
+"""
 
-2. As seções devem ficar alinhadas à margem esquerda.
-3. Dentro de cada seção, os itens devem iniciar com marcador •.
-4. Dentro de EXPECTATIVA, após **O que precisa ser feito:**, devem existir os subitens:
-   ◦ **Verificação da Causa Raiz:**
-   ◦ **Correção do Caso Evidenciado:**
-   ◦ **Investigação e Correção de Novos Casos:**
-5. Todos os títulos dos campos devem estar em negrito e seguidos de dois pontos, com o conteúdo na mesma linha.
-6. Não invente informações. Use apenas o que estiver no histórico.
-7. Se alguma informação estiver ausente, preencha de forma profissional e neutra, sem inventar dados específicos.
-8. O impacto deve ser coerente com o relato.
-9. Retorne SOMENTE a tarefa final pronta para copiar e colar.
-
-Modelo obrigatório:
+FORMATO OBRIGATÓRIO:
 
 **1. OCORRÊNCIA**
 • **Quem solicita:** ...
@@ -538,293 +543,568 @@ Modelo obrigatório:
 
 **3. EXPECTATIVA**
 • **O que precisa ser feito:**
-  ◦ **Verificação da Causa Raiz:** ...
-  ◦ **Correção do Caso Evidenciado:** ...
-  ◦ **Investigação e Correção de Novos Casos:** ...
+◦ **Verificação da Causa Raiz:** ...
+◦ **Correção do Caso Evidenciado:** ...
+◦ **Investigação e Correção de Novos Casos:** ...
 • **Detalhes importantes:** ...
 
 **4. IMPACTO**
 • **Classificação do impacto:** ...
 • **Descrição do impacto:** ...
-
-Dados do ticket:
-- ID: ${ticket?.id ?? "N/A"}
-- Assunto: ${ticket?.subject ?? "N/A"}
-- Categoria: ${ticket?.category ?? "N/A"}
-- Status: ${ticket?.status ?? "N/A"}
-
-Histórico de ações:
-${history}
 `.trim();
 }
 
-async function generateN2Task(ticket) {
-  const prompt = buildN2Prompt(ticket);
+function extractResponseOutputText(data) {
+  if (!data) return "";
 
-  const response = await openai.responses.create({
-    model: OPENAI_MODEL,
-    input: [
-      {
-        role: "system",
-        content: "Você gera tarefas N2 em português do Brasil, seguindo layout rígido.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text;
+  }
 
-  return normalizeText(response.output_text || "");
+  if (Array.isArray(data.output)) {
+    const parts = [];
+
+    for (const item of data.output) {
+      if (!Array.isArray(item.content)) continue;
+
+      for (const content of item.content) {
+        if (
+          (content.type === "output_text" || content.type === "text") &&
+          typeof content.text === "string"
+        ) {
+          parts.push(content.text);
+        }
+      }
+    }
+
+    return parts.join("\n").trim();
+  }
+
+  return "";
 }
 
-/* =========================
- * VALIDACAO DA SAIDA
- * ========================= */
-function validateN2Output(text) {
-  const checks = [
-    "**1. OCORRÊNCIA**",
-    "**2. VERIFICAÇÃO REALIZADA**",
-    "**3. EXPECTATIVA**",
-    "**4. IMPACTO**",
-    "**Quem solicita:**",
-    "**Motivação:**",
-    "**Recurso do sistema:**",
-    "**Análise do caso:**",
-    "**Motivo do encaminhamento:**",
-    "**O que precisa ser feito:**",
-    "**Verificação da Causa Raiz:**",
-    "**Correção do Caso Evidenciado:**",
-    "**Investigação e Correção de Novos Casos:**",
-    "**Detalhes importantes:**",
-    "**Classificação do impacto:**",
-    "**Descrição do impacto:**",
+// =====================================================================================
+// INTELIGÊNCIA DE SELEÇÃO DA AÇÃO
+// =====================================================================================
+
+function normalizeText(text = "") {
+  return String(text)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<li>/gi, "• ")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function removeAccents(text = "") {
+  return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function safeLower(text = "") {
+  return removeAccents(String(text).toLowerCase());
+}
+
+function isInternalAction(action) {
+  return action?.type === 1;
+}
+
+function getActionDate(action) {
+  const raw =
+    action?.createdDate ||
+    action?.date ||
+    action?.created_at ||
+    action?.originDate ||
+    null;
+
+  const dt = raw ? new Date(raw) : null;
+  return dt && !Number.isNaN(dt.getTime()) ? dt : null;
+}
+
+function getActionAuthorName(action) {
+  return (
+    action?.createdBy?.businessName ||
+    action?.createdBy?.name ||
+    action?.owner?.businessName ||
+    action?.owner?.name ||
+    action?.createdByName ||
+    ""
+  );
+}
+
+function isAutomationGeneratedText(text = "") {
+  const t = safeLower(text);
+
+  const automationPatterns = [
+    "1. ocorrencia",
+    "2. verificacao realizada",
+    "3. expectativa",
+    "4. impacto",
+    "**1. ocorrencia**",
+    "**2. verificacao realizada**",
+    "**3. expectativa**",
+    "**4. impacto**",
+    "gerar_tarefa_n2",
+    "tarefa_n2_gerada",
+    "erro_gerar_tarefa_n2",
   ];
 
-  const missing = checks.filter((item) => !text.includes(item));
+  return automationPatterns.some((p) => t.includes(p));
+}
+
+function looksLikeSystemNoise(text = "") {
+  const t = safeLower(text);
+
+  const noisePatterns = [
+    "ticket encaminhado",
+    "sla alterado",
+    "status alterado",
+    "responsavel alterado",
+    "responsável alterado",
+    "categoria alterada",
+    "urgencia alterada",
+    "urgência alterada",
+    "prioridade alterada",
+    "acao automatica",
+    "ação automática",
+    "movidesk",
+    "email recebido",
+    "email enviado",
+    "chat encerrado",
+    "ticket encerrado",
+  ];
+
+  return noisePatterns.some((p) => t.includes(p));
+}
+
+function countKeywordMatches(text = "", keywords = []) {
+  const t = safeLower(text);
+  return keywords.reduce((acc, keyword) => {
+    return acc + (t.includes(safeLower(keyword)) ? 1 : 0);
+  }, 0);
+}
+
+function hasN2Marker(text = "") {
+  const t = safeLower(text);
+  return t.includes("[n2]") || t.includes("inicio_tarefa_n2") || t.includes("#n2");
+}
+
+function calculateActionScore(action, referenceDate = null) {
+  const rawText = action?.description || action?.text || "";
+  const text = normalizeText(rawText);
+  const date = getActionDate(action);
+
+  let score = 0;
+
+  if (hasN2Marker(text)) score += 100;
+
+  const length = text.length;
+  if (length >= 300) score += 30;
+  else if (length >= 180) score += 20;
+  else if (length >= 120) score += 12;
+  else score -= 20;
+
+  const strongKeywords = [
+    "verificado",
+    "verifiquei",
+    "analise",
+    "análise",
+    "nao foi possivel",
+    "não foi possível",
+    "necessario",
+    "necessário",
+    "encaminhamento",
+    "causa raiz",
+    "correcao",
+    "correção",
+    "acerto de base",
+    "impacto",
+    "cliente",
+    "contrato",
+    "parcela",
+    "erro",
+    "critica",
+    "crítica",
+    "reproduzido",
+    "evidenciado",
+    "expectativa",
+    "ocorrencia",
+    "ocorrência",
+    "n2",
+  ];
+
+  const weakKeywords = [
+    "cpf",
+    "cnpj",
+    "titulo",
+    "título",
+    "boleto",
+    "sms",
+    "whatsapp",
+    "negociacao",
+    "negociação",
+    "integracao",
+    "integração",
+    "sienge",
+    "omie",
+    "serasa",
+    "spc",
+    "pix",
+    "stage",
+    "api",
+  ];
+
+  score += countKeywordMatches(text, strongKeywords) * 8;
+  score += countKeywordMatches(text, weakKeywords) * 3;
+
+  if (safeLower(text).includes("motivo do encaminhamento")) score += 20;
+  if (safeLower(text).includes("o n2 deve")) score += 25;
+  if (safeLower(text).includes("impacto")) score += 10;
+  if (safeLower(text).includes("via tela")) score += 10;
+  if (safeLower(text).includes("ao tentar")) score += 8;
+  if (safeLower(text).includes("foi identificado")) score += 8;
+  if (safeLower(text).includes("foi verificado")) score += 10;
+
+  if (isAutomationGeneratedText(text)) score -= 200;
+  if (looksLikeSystemNoise(text)) score -= 40;
+
+  if (referenceDate && date) {
+    const diffMs = Math.abs(referenceDate.getTime() - date.getTime());
+    const diffMinutes = diffMs / (1000 * 60);
+
+    if (diffMinutes <= 2) score += 35;
+    else if (diffMinutes <= 5) score += 25;
+    else if (diffMinutes <= 15) score += 15;
+    else if (diffMinutes <= 60) score += 5;
+  }
+
+  return score;
+}
+
+function isValidCandidateAction(action, options = {}) {
+  const { automationAuthorNames = [], referenceDate = null } = options;
+
+  if (!action) return false;
+  if (!isInternalAction(action)) return false;
+
+  const rawText = action?.description || action?.text || "";
+  const text = normalizeText(rawText);
+
+  if (!text) return false;
+
+  // Regra mais segura:
+  // texto curto só entra se vier com marcador [N2]
+  if (text.length < 120 && !hasN2Marker(text)) return false;
+
+  const authorName = safeLower(getActionAuthorName(action));
+  const automationAuthorsNormalized = automationAuthorNames.map(safeLower);
+
+  if (
+    authorName &&
+    automationAuthorsNormalized.some(
+      (name) => name && authorName.includes(name)
+    )
+  ) {
+    return false;
+  }
+
+  if (isAutomationGeneratedText(text)) return false;
+
+  const actionDate = getActionDate(action);
+  if (referenceDate && actionDate && actionDate > referenceDate) {
+    return false;
+  }
+
+  return true;
+}
+
+function selectBestN2SourceAction(actions = [], options = {}) {
+  const { automationAuthorNames = [], referenceDate = null, debug = false } = options;
+
+  const candidates = actions
+    .filter((action) =>
+      isValidCandidateAction(action, {
+        automationAuthorNames,
+        referenceDate,
+      })
+    )
+    .map((action) => {
+      const text = normalizeText(action?.description || action?.text || "");
+      const score = calculateActionScore(action, referenceDate);
+
+      return {
+        action,
+        text,
+        score,
+        author: getActionAuthorName(action),
+        date: getActionDate(action),
+      };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+
+      const dateA = a.date ? a.date.getTime() : 0;
+      const dateB = b.date ? b.date.getTime() : 0;
+      return dateB - dateA;
+    });
+
+  if (debug) {
+    console.log("===== CANDIDATAS N2 =====");
+    for (const item of candidates.slice(0, 10)) {
+      console.log({
+        score: item.score,
+        author: item.author,
+        date: item.date?.toISOString?.() || null,
+        preview: item.text.slice(0, 180),
+      });
+    }
+  }
+
+  if (!candidates.length) {
+    return {
+      selectedAction: null,
+      selectedText: null,
+      candidates: [],
+    };
+  }
 
   return {
-    isValid: missing.length === 0,
-    missing,
+    selectedAction: candidates[0].action,
+    selectedText: candidates[0].text,
+    candidates,
   };
 }
 
-/* =========================
- * PROCESSAMENTO PRINCIPAL
- * ========================= */
-async function processTicketJob(job) {
-  const { ticketId, source = "webhook" } = job;
+// =====================================================================================
+// TAGS
+// =====================================================================================
 
-  info("Iniciando processamento do ticket", { ticketId, source });
+function getTicketTags(ticket) {
+  const raw = ticket?.tags;
 
-  const ticket = await retry(
-    () => getTicketById(ticketId),
-    "Falha ao consultar ticket"
+  if (!raw) return [];
+
+  if (Array.isArray(raw)) {
+    return raw
+      .map((tag) => String(tag).trim())
+      .filter(Boolean);
+  }
+
+  if (typeof raw === "string") {
+    return raw
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+function hasTag(tags = [], expectedTag = "") {
+  return tags.some((tag) => safeLower(tag) === safeLower(expectedTag));
+}
+
+function mergeTags(existingTags = [], { add = [], remove = [] } = {}) {
+  const normalizedRemove = remove.map(safeLower);
+
+  const kept = existingTags.filter(
+    (tag) => !normalizedRemove.includes(safeLower(tag))
   );
 
-  const tags = extractTags(ticket);
+  const result = [...kept];
 
-  info("Tags lidas do ticket", {
-    ticketId,
-    rawTags: ticket?.tags,
-    normalizedTags: tags,
-    tagEsperada: TAG_GERAR,
-  });
-
-  const hasTriggerTag = tags.some(
-    (tag) => String(tag).trim().toLowerCase() === TAG_GERAR.trim().toLowerCase()
-  );
-
-  if (!hasTriggerTag) {
-    warn("Webhook ignorado", {
-      ticketId,
-      motivo: `Tag ${TAG_GERAR} não está presente`,
-    });
-    return;
-  }
-
-  const triggerAction = findTriggerAction(ticket);
-
-  if (!triggerAction) {
-    warn("Webhook ignorado", {
-      ticketId,
-      motivo: "Nenhuma ação gatilho encontrada",
-    });
-    return;
-  }
-
-  const actionKey = buildActionKey(triggerAction);
-  const processingKey = buildProcessingKey(ticketId, actionKey);
-
-  if (activeProcessingKeys.has(processingKey)) {
-    warn("Webhook ignorado", {
-      ticketId,
-      motivo: "Essa solicitação já está em processamento",
-      processingKey,
-    });
-    return;
-  }
-
-  if (hasProcessedEvent(processingKey)) {
-    warn("Webhook ignorado", {
-      ticketId,
-      motivo: "Essa mesma solicitação já foi processada",
-      processingKey,
-    });
-    return;
-  }
-
-  activeProcessingKeys.add(processingKey);
-
-  try {
-    info("Solicitação elegível para geração", {
-      ticketId,
-      actionKey,
-      processingKey,
-      triggerActionId: triggerAction.id,
-      triggerActionDate: triggerAction.createdDate,
-    });
-
-    const n2Text = await retry(
-      () => generateN2Task(ticket),
-      "Falha ao gerar tarefa N2 na OpenAI"
-    );
-
-    const validation = validateN2Output(n2Text);
-
-    if (!validation.isValid) {
-      throw new Error(
-        `Saída da IA inválida. Campos ausentes: ${validation.missing.join(", ")}`
-      );
+  for (const tag of add) {
+    if (!result.some((existing) => safeLower(existing) === safeLower(tag))) {
+      result.push(tag);
     }
+  }
 
-    const n2Html = n2MarkdownToHtml(n2Text);
+  return result;
+}
 
-    await retry(
-      () => createInternalAction(ticketId, n2Html),
-      "Falha ao gravar ação interna no Movidesk"
+// =====================================================================================
+// DEDUP / PROCESS CONTROL
+// =====================================================================================
+
+function ensureDataFiles() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+
+  if (!fs.existsSync(PROCESSED_FILE)) {
+    fs.writeFileSync(
+      PROCESSED_FILE,
+      JSON.stringify(
+        {
+          processedKeys: {},
+          processedSourceFingerprints: {},
+        },
+        null,
+        2
+      ),
+      "utf-8"
     );
-
-    const updatedTags = addTag(removeTag(tags, TAG_GERAR), TAG_GERADA)
-      .filter((t) => t !== TAG_ERRO);
-
-    await retry(
-      () => updateTicketTags(ticketId, updatedTags),
-      "Falha ao atualizar tags do ticket"
-    );
-
-    markProcessedEvent(processingKey, ticketId, actionKey);
-
-    info("Processamento finalizado com sucesso", {
-      ticketId,
-      processingKey,
-    });
-  } catch (err) {
-    error("Falha no processamento do ticket", {
-      ticketId,
-      processingKey,
-      error: err.message,
-    });
-
-    try {
-      const ticketAtualizado = await getTicketById(ticketId);
-      const tagsAtuais = extractTags(ticketAtualizado);
-      const fallbackTags = addTag(tagsAtuais, TAG_ERRO);
-
-      await updateTicketTags(ticketId, fallbackTags);
-    } catch (tagErr) {
-      error("Falha ao adicionar tag de erro", {
-        ticketId,
-        error: tagErr.message,
-      });
-    }
-  } finally {
-    activeProcessingKeys.delete(processingKey);
   }
 }
 
-/* =========================
- * ROTAS
- * ========================= */
-app.get("/health", (_, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "movidesk-openai-n2",
-    time: new Date().toISOString(),
-    queueSize: queue.length,
-    activeProcessing: activeProcessingKeys.size,
-  });
-});
+function loadProcessedState() {
+  try {
+    const raw = fs.readFileSync(PROCESSED_FILE, "utf-8");
+    const data = JSON.parse(raw);
 
-app.post("/process/:ticketId", async (req, res) => {
-  const ticketId = Number(req.params.ticketId);
+    return {
+      processedKeys: data?.processedKeys || {},
+      processedSourceFingerprints: data?.processedSourceFingerprints || {},
+    };
+  } catch {
+    return {
+      processedKeys: {},
+      processedSourceFingerprints: {},
+    };
+  }
+}
 
-  if (!ticketId) {
-    return res.status(400).json({ ok: false, error: "ticketId inválido" });
+function saveProcessedState(state) {
+  fs.writeFileSync(PROCESSED_FILE, JSON.stringify(state, null, 2), "utf-8");
+}
+
+function buildProcessingKey({ source, ticketId, referenceDate, payload }) {
+  const hash = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        source,
+        ticketId,
+        referenceDate: referenceDate?.toISOString?.() || null,
+        payload,
+      })
+    )
+    .digest("hex");
+
+  return `${source}:${ticketId}:${hash}`;
+}
+
+function buildSourceFingerprint(ticketId, action, text) {
+  const hash = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        ticketId,
+        actionDate: getActionDate(action)?.toISOString?.() || null,
+        author: getActionAuthorName(action),
+        text,
+      })
+    )
+    .digest("hex");
+
+  return `source:${ticketId}:${hash}`;
+}
+
+function isProcessingOrProcessed(processingKey) {
+  if (activeProcessingKeys.has(processingKey)) return true;
+
+  const state = loadProcessedState();
+  return Boolean(state.processedKeys[processingKey]);
+}
+
+function markProcessing(processingKey) {
+  activeProcessingKeys.add(processingKey);
+}
+
+function unmarkProcessing(processingKey) {
+  activeProcessingKeys.delete(processingKey);
+}
+
+function markProcessed(processingKey, metadata = {}) {
+  const state = loadProcessedState();
+  state.processedKeys[processingKey] = {
+    processedAt: new Date().toISOString(),
+    ...metadata,
+  };
+
+  if (metadata?.sourceFingerprint) {
+    state.processedSourceFingerprints[metadata.sourceFingerprint] = {
+      processedAt: new Date().toISOString(),
+      ticketId: metadata.ticketId,
+      status: metadata.status,
+    };
   }
 
-  enqueueJob({
-    ticketId,
-    source: "manual",
-  });
+  saveProcessedState(state);
+}
 
-  return res.status(202).json({
-    ok: true,
-    message: "Ticket enviado para fila de processamento",
-    ticketId,
-  });
-});
+function hasProcessedSourceFingerprint(sourceFingerprint) {
+  const state = loadProcessedState();
+  return Boolean(state.processedSourceFingerprints[sourceFingerprint]);
+}
 
-app.post("/webhook", async (req, res) => {
-  const body = req.body;
-  const ticketId = extractTicketIdFromWebhook(body);
+// =====================================================================================
+// HELPERS
+// =====================================================================================
 
-  info("Webhook recebido", {
-    ticketId,
-    bodyKeys: body ? Object.keys(body) : [],
-    bodyPreview: {
-      id: body?.id,
-      Id: body?.Id,
-      ticketId: body?.ticketId,
-      TicketId: body?.TicketId,
-      ticket_id: body?.ticket_id,
-      ticket: body?.ticket ? Object.keys(body.ticket) : null,
-      data: body?.data ? Object.keys(body.data) : null,
-      object: body?.object ? Object.keys(body.object) : null,
-    },
-  });
+function extractTicketId(body = {}) {
+  const candidates = [
+    body?.ticket?.id,
+    body?.ticket?.Id,
+    body?.ticketId,
+    body?.TicketId,
+    body?.id,
+    body?.Id,
+    body?.data?.ticket?.id,
+    body?.data?.ticketId,
+    body?.object?.id,
+    body?.entity?.id,
+  ];
 
-  if (!ticketId) {
-    warn("Webhook ignorado", {
-      motivo: "Não foi possível identificar o ticketId no payload",
-    });
-
-    return res.status(200).json({
-      ok: true,
-      ignored: true,
-      reason: "ticketId não encontrado",
-    });
+  for (const value of candidates) {
+    const num = Number(value);
+    if (num) return num;
   }
 
-  enqueueJob({
-    ticketId: Number(ticketId),
-    source: "webhook",
-  });
+  return null;
+}
 
-  return res.status(200).json({
-    ok: true,
-    queued: true,
-    ticketId: Number(ticketId),
-  });
-});
+function extractEventDate(body = {}) {
+  const candidates = [
+    body?.eventDate,
+    body?.date,
+    body?.createdDate,
+    body?.triggerDate,
+    body?.updatedDate,
+    body?.data?.eventDate,
+    body?.data?.date,
+  ];
 
-app.listen(PORT, () => {
-  info("Servidor iniciado", {
-    port: PORT,
-    movideskBaseUrl: MOVIDESK_BASE_URL,
-    tagGerar: TAG_GERAR,
-    tagGerada: TAG_GERADA,
-    tagErro: TAG_ERRO,
-    processedEventsFile: PROCESSED_EVENTS_FILE,
-  });
-});
+  for (const value of candidates) {
+    const dt = value ? new Date(value) : null;
+    if (dt && !Number.isNaN(dt.getTime())) return dt;
+  }
+
+  return null;
+}
+
+function parseJsonSafe(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function markdownLikeToHtml(text = "") {
+  let html = String(text || "").trim();
+
+  html = html
+    .replace(/\r/g, "")
+    .replace(/\n/g, "<br>")
+    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+
+  return html;
+}
